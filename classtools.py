@@ -1,8 +1,8 @@
 
-__all__ = ['attribute', 'descriptor', 'variantmethod', 'Signal']
+__all__ = ['immutable_property', 'descriptor', 'variantmethod', 'Signal']
 
 import types
-from typing import TypeVar, Generic, ParamSpec, overload, Concatenate, Any
+from typing import TypeVar, Generic, ParamSpec, overload, Concatenate, Any, Self
 from collections.abc import Callable
 
 _T = TypeVar('_T')
@@ -14,64 +14,71 @@ _R_co = TypeVar('_R_co', covariant=True)
 
 ### Attribute
 
-class attribute(Generic[_T, _VT]):
+class immutable_property(Generic[_T, _VT]): # Similar to the cached_property in functools.py
+    """An immutable property reference.
+
+    The __get__ method of this descriptor runs as a default factory at the first
+    access to the attribute, and then stores the result in the instance, which
+    is similar to the cached_property in functools.py.
+
+    This type of property references cannot be changed after the first access,
+    but can be deleted to reverted to the default value, and the referenced
+    objects can still be mutable."""
     __slots__ = ('__name__', '_default', '_default_factory')
 
-    def __init__(
-        self,
-        fnew: Callable[[_T], _VT] | None = None,
-        default: _VT | None = None,
-    ) -> None:
+    def __init__(self, fnew: Callable[[_T], _VT] | None = None) -> None:
         self.__name__ = None
-        self._default = default
         self._default_factory = fnew
 
-    def __set_name__(self, owner: type[_T], name: str):
-        self.__name__ = name
+    def __set_name__(self, owner, name: str, /):
+        if self.__name__ is None:
+            self.__name__ = name
+        elif name != self.__name__ and not name.startswith('_'):
+            raise TypeError(
+                "Cannot assign the same attribute to two different names "
+                f"({self.__name__!r} and {name!r})."
+            )
 
-    def __get__(self, obj: _T, objtype: type[_T]) -> _VT:
-        assert self.__name__ is not None
-        self._check_dict(obj)
-
+    @overload
+    def __get__(self, obj: None, objtype: type, /) -> Self: ...
+    @overload
+    def __get__(self, obj: _T, objtype: type[_T], /) -> _VT: ...
+    def __get__(self, obj, objtype, /):
         if obj is None:
-            return self._make_default(obj, objtype)
+            return self
+        assert self.__name__ is not None
 
-        # Look for the attribute in the instance first.
-        if self.__name__ in obj.__dict__:
-            return obj.__dict__[self.__name__]
+        storage = self._get_storage(obj)
+
+        if self.__name__ in storage:
+            return storage[self.__name__]
         else:
-            value = self._make_default(obj, objtype)
-            obj.__dict__[self.__name__] = value
+            value = self._default_factory.__get__(obj, objtype)()
+            storage[self.__name__] = value
             return value
 
     def __set__(self, obj: _T, value: _VT, /) -> None:
-        assert self.__name__ is not None
-        self._check_dict(obj)
+        raise TypeError("can not assign to an immutable property")
 
-        obj.__dict__[self.__name__] = value
+    def __delete__(self, obj: _T, /) -> None:
+        storage = self._get_storage(obj)
 
-    def __delete__(self, obj: _T) -> None:
-        self._check_dict(obj)
+        if self.__name__ in storage:
+            del storage[self.__name__]
 
-        if self.__name__ in obj.__dict__:
-            del self.__dict__[self.__name__]
-
-    def _check_dict(self, obj: _T):
+    def _get_storage(self, obj: _T):
         try:
-            obj.__dict__
-        except AttributeError:
-            raise TypeError("must have __dict__ attribute")
-
-    def _make_default(self, obj: _T, objtype: type[_T]) -> _VT:
-        if self._default_factory is not None:
-            return self._default_factory.__get__(obj, objtype)()
-        else:
-            return self._default
+            return obj.__dict__
+        except AttributeError as e:
+            raise TypeError(
+                f"No '__dict__' attribute on {type(obj).__name__!r} "
+                f"instance to save {self.__name__!r} property."
+            ) from e
 
 
-def descriptor(factory: Callable[_P, _VT], /) -> Callable[_P, attribute[_T, _VT]]:
+def descriptor(factory: Callable[_P, _VT], /) -> Callable[_P, immutable_property[_T, _VT]]:
     def wrapper(*args, **kwargs):
-        return attribute(lambda _: factory(*args, **kwargs))
+        return immutable_property(lambda _: factory(*args, **kwargs))
     return wrapper
 
 
@@ -113,7 +120,7 @@ class _Variant(Generic[_KT, _T, _P, _R_co]):
         return types.MappingProxyType(self._vt_ref)
 
 
-class variantmethod(attribute[_T, _Variant[_KT, _T, _P, _R_co]], Generic[_KT, _T, _P, _R_co]):
+class variantmethod(immutable_property[_T, _Variant[_KT, _T, _P, _R_co]], Generic[_KT, _T, _P, _R_co]):
     """Variant method decorator class for implementing a key-based method
     dispatch mechanism.
 
@@ -164,9 +171,9 @@ class variantmethod(attribute[_T, _Variant[_KT, _T, _P, _R_co]], Generic[_KT, _T
             return super().__new__(cls)
 
     def __init__(self, key: _KT, func: Callable[Concatenate[_T, _P], _R_co], /):
-        self.__func__ = func
-        self.virtual_table = {key: func}
         super().__init__(lambda obj: _Variant(key, obj, self.virtual_table))
+        self.virtual_table = {key: func}
+        self.__doc__ = func.__doc__
 
     def __set__(self, obj: _T, value: _VT):
         raise TypeError("can not assign to variant methods")
@@ -219,7 +226,7 @@ class _Emitter(Generic[_VT]):
         return target
 
 
-class Signal(attribute[_T, _Emitter[_VT]]):
+class Signal(immutable_property[_T, _Emitter[_VT]]):
     callbacks: list[Callable[[_VT], Any]]
 
     def __init__(self, dtype: type[_VT], /):
