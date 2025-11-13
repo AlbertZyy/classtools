@@ -4,18 +4,13 @@ __all__ = [
     'descriptor',
     'variantmethod',
     'Signal',
-    'signalmethod'
+    'signalmethod',
+    'declare'
 ]
 
 import types
 from typing import overload, Concatenate, Protocol, Self, Any
 from collections.abc import Callable
-
-
-### Types
-
-class SupportsGet[T, R](Protocol):
-    def __get__(self, instance: T, owner: type[T]) -> R: ...
 
 
 ### Attribute
@@ -32,11 +27,11 @@ class immutable_property[T, VT]: # Similar to the cached_property in functools.p
     objects can still be mutable."""
     __slots__ = ('__name__', '_default', '_default_factory')
 
-    def __init__(self, fnew: Callable[[T], VT] | None = None) -> None:
+    def __init__(self, fnew: Callable[[T], VT]) -> None:
         self.__name__ = None
         self._default_factory = fnew
 
-    def __set_name__(self, owner, name: str, /):
+    def __set_name__(self, owner: type[T], name: str, /):
         if self.__name__ is None:
             self.__name__ = name
         elif name != self.__name__ and not name.startswith('_'):
@@ -88,7 +83,9 @@ def descriptor[**P, VT](factory: Callable[P, VT], /) -> Callable[P, immutable_pr
     return wrapper
 
 
-### VariantMethod
+# ------------------------------
+# Variant Methods
+# ------------------------------
 
 class _Variant[KT, T, **P, R]:
     def __init__(
@@ -181,7 +178,7 @@ class variantmethod[KT, T, **P, R](immutable_property[T, _Variant[KT, T, P, R]])
         self.virtual_table = {key: func}
         self.__doc__ = func.__doc__
 
-    def __set__(self, obj, value):
+    def __set__(self, instance: T, value):
         raise TypeError("can not assign to variant methods")
 
     def register(self, key: KT, /):
@@ -191,7 +188,9 @@ class variantmethod[KT, T, **P, R](immutable_property[T, _Variant[KT, T, P, R]])
         return decorator
 
 
-### Signal
+# ------------------------------
+# Signal
+# ------------------------------
 
 class _Emitter[VT]:
     def __init__(self, obj, cb_m: list, cb_f: list):
@@ -222,11 +221,11 @@ class _Emitter[VT]:
 
             func(*value)
 
-    def connect[R](self, target: Callable[[VT], R], /):
+    def connect[R](self, target: Callable[..., R], /):
         self._cb_list.append(target)
         return target
 
-    def disconnect[R](self, target: Callable[[VT], R], /):
+    def disconnect[R](self, target: Callable[..., R], /):
         try:
             self._cb_list.remove(target)
         except ValueError:
@@ -241,10 +240,10 @@ class Signal[T, VT](immutable_property[T, _Emitter[VT]]):
         self._cb_f = []
         self.dtype = dtype
 
-    def __set__(self, obj: T, value: VT):
+    def __set__(self, instance: T, value):
         raise TypeError("can not assign to signals")
 
-    def bindm[R](self, func: SupportsGet[T, Callable[[VT], R]], /):
+    def bindm[V](self, func: V, /) -> V:
         """Binds a descriptor to the signal. The descriptor supports
         `__get__` returning a callable."""
         if not hasattr(func, "__get__"):
@@ -252,7 +251,7 @@ class Signal[T, VT](immutable_property[T, _Emitter[VT]]):
         self._cb_m.append(func)
         return func
 
-    def unbindm[R](self, func: SupportsGet[T, Callable[[VT], R]], /):
+    def unbindm[V](self, func: V, /) -> V:
         self._cb_m.remove(func)
         return func
 
@@ -274,3 +273,91 @@ def signalmethod[T, V](func: Callable[[T, V], Any], /) -> Signal[T, V]:
     s = Signal()
     s.bindm(func) # This checks if func is a descriptor.
     return s
+
+
+# ------------------------------
+# External Methods
+# ------------------------------
+
+class declare[T, **P, R]:
+    """Declare the signature of a method and subsequently provide
+    its implementation."""
+    __slots__ = ("__name__", "__stub__", "__func__")
+    __name__: str | None
+
+    def __init__(self, stub: Callable[Concatenate[T, P], R], /):
+        self.__name__ = None
+        self.__stub__ = stub
+        self.__func__ = None
+
+    def __set_name__(self, owner: type[T], name: str) -> None:
+        if self.__name__ is None:
+            self.__name__ = name
+        elif name != self.__name__:
+            raise TypeError(
+                "Cannot assign the same declare to two different names "
+                f"({self.__name__!r} and {name!r})."
+            )
+
+    def _get_name_of_stub(self) -> str:
+        if hasattr(self.__stub__, "__name__"):
+            return self.__stub__.__name__
+        elif hasattr(self.__stub__, "__qualname__"):
+            return self.__stub__.__qualname__
+        else:
+            stub_type = type(self.__stub__)
+            return stub_type.__name__
+
+    @overload
+    def __get__(self, instance: T, owner: type[T]) -> Callable[P, R]: ...
+    @overload
+    def __get__[V](self, instance: None, owner: type[T]) -> Callable[[V], V]: ...
+    def __get__(self, instance, owner):
+        if instance is None: # if fetched by class
+            return lambda f: self.impl(f, owner)
+
+        if self.__func__ is None:
+            raise NotImplementedError(
+                "can not find the implementation of the method "
+                f"{self.__name__!r} in {owner.__name__!r}."
+            )
+
+        if hasattr(self.__func__, "__get__"):
+            return self.__func__.__get__(instance, owner)
+        else:
+            return self.__func__
+
+    def __set__(self, instance: T, value):
+        raise TypeError("Cannot assign to a method")
+
+    def impl(self, func, owner: type[T] | None = None):
+        if not callable(func) and not hasattr(func, "__get__"):
+            raise TypeError("expected a callable or a descriptor for "
+                            f"implementation, but got {type(func)!r}")
+
+        if (owner is not None) and (self.__name__ not in owner.__dict__):
+            if self.__name__ is None:
+                raise TypeError("only declarations inside a class can be "
+                                "implemented with an owner (subclass)")
+            if self.__name__ in owner.__dict__:
+                raise TypeError(f"class {owner!r} already has an attribute "
+                                f"named {self.__name__!r} in its __dict__")
+            # if implement for subclasses: copy is needed for override
+            new_ext = declare(self.__stub__)
+            new_ext.__name__ = self.__name__
+            new_ext.__func__ = func
+            setattr(owner, self.__name__, new_ext)
+            return func
+
+        if self.__func__ is None:
+            self.__func__ = func
+            return func
+
+        # if already implemented
+        raise TypeError(
+            f"function {self._get_name_of_stub()!r} "
+            "has already been implemented"
+            if owner is None else
+            f"method {self.__name__!r} of class {owner.__name__!r} "
+            "has already been implemented"
+        )
